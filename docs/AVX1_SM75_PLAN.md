@@ -48,6 +48,52 @@ Kept changes:
 4. **Router lookahead without AVX2**: `bf16_rows_dot_multi_avx1` (multiply + add), so the file-tier prefetch no
    longer runs AVX2/FMA code on this CPU (it was a SIGILL path; off in the current RAM-arena config).
 5. **GCC 14.2** for C, C++ and the CUDA host (`build-gcc14`), same options as `build`.
+6. **Gate/up MMQ reads the experts in place** (patched copy of llama.cpp's `mmq.cuh` in the build tree): copy kernel
+   75.5 → 31.9 ms per card per turn, engine read −0.7 %. Exact (agent gate PASS). `STRATA_MMQ_INPLACE=0` = old path.
+7. **Grid codebooks in shared memory on Turing** (decode expert kernels; from xrip/llama.cpp-avx1-numa-sm75
+   1536af3b9): `iq_multi_parity` 0 failures; decode +2.0 %.
+8. **`STRATA_HC_FP16=1`** (opt-in, **not bit-exact**): hc read's BF16 GEMMs on FP16 tensor cores. Incremental read
+   −7.7 % per turn, cold 34K −13.6 %. Quality (`prefill_probe.py`, 24 prompts 8K-24K): 20/24 answers identical,
+   24/24 same first token; for scale, an exact rerun 24/24 / 24/24 and `--prefill 4096` 17/24 / 23/24.
+9. **Prompt attention, int8 K/V on Turing**: next chunk prefetched in registers, K and V sharing one shared buffer
+   (37.9 → 29.2 KB, two blocks per SM). Bitwise identical (output checksums); kernel −40 % (2,048 queries at 140K:
+   21.94 → 13.31 ms); incremental read −3.5 % per turn; agent gate PASS.
+10. **Decode hc read, up projection** (`gr_up_multi_kernel`): `lo` staged as two planes (every read had hit its
+    shared-memory bank twice: 415K of 826K wavefronts were conflicts) and two rows per pass with the (row, token)
+    reductions interleaved (ncu: stalls were `short_scoreboard`). Bitwise identical (`hc_read_bench` checksums for
+    1-8 tokens, `gr_parity`); kernel 30.0 → 23.6 µs at 4 tokens; one hc read call −6 % to −11 % at 3-8 tokens
+    (+2 % at 1); agent session: identical text on all 36 turns, decode median +1.5 %.
+    Measured and dropped for the down projection: 54 blocks of 6 warps instead of 41 of 8 (+9 %), weights two tiles
+    ahead (slower too).
+11. **MMQ: the IQ3_XXS codebook in shared memory** (configure-time patch of the build tree's `mmq.cuh` /
+    `mmq-load-tiles.cuh` copies, each text required exactly once): the tile loader's 8 scattered 4-byte lookups per
+    thread and tile now hit a 1 KB table that `mul_mat_q<IQ3_XXS>` copies to shared memory first. Same checksums
+    (`prefill_mmq_bench`, 87 and 400 rows per expert); gate/up −3.5..−3.9 %, down (Q2_0) unchanged; agent session back
+    to back with the base: identical text on all 36 turns, incremental read median −0.3 % (CUDA1 is PCIe-bound, see
+    below).
+
+Measured and dropped (bitwise identical, not faster):
+- **Dense decode GEMVs with the columns in shared memory** (`native_mmvq_multi_kernel`; ncu: `lg_throttle` first):
+  blocks that copy the Q8_1 columns once and loop over rows. Head −6 %, IQ4_XS −8..−21 % at 2-4 columns, but Q6_K
+  +8..+25 % and most shapes much slower at 6-8 columns (fewer resident warps); with four row groups per block still
+  mixed (`mmvq_bench`).
+- **MMQ tile-load pipelining**: ncu: `mul_mat_q` holds 255 registers and 53 KB of shared memory, one 8-warp block
+  per SM, issue slots 25-29 % busy, no single stall; pipelining its tile loads needs registers it does not have, and
+  two blocks per SM (I = 64) gave nothing earlier. Not attempted beyond the codebook step (item 11).
+
+**One incremental turn at ~140K (+4.4K tokens), nsys, current binary**: the cards read the prompt one after the
+other (CUDA0 2.77 s, then CUDA1 2.58 s). CUDA0 is kernel-bound (kernels 2.58 s; 11 GB of expert uploads take 1.87 s
+beside them); CUDA1 is PCIe-bound (14 GB of uploads take 2.45 s of its 2.58 s; kernels 2.2 s), so faster kernels
+help CUDA1 little. Kernels per card: `mul_mat_q` 821 / 690 ms, magma BF16 (hc read) 684 / 540, `prompt_attn` 181 /
+181, `block_scores` 145 / 139, FP16 GEMMs 184 / 153, GDN 118 / 94. Overlapping the two cards needs more than one
+chunk per turn, and the chunk size changes the text: not an exact step.
+
+Measured and dropped: `--kv fp16` (more precise than int8, attention 3.5x faster) — but twice the KV bytes to stage
+and read: incremental read **+7.6 %** per turn.
+
+**Decode is not always reproducible run to run** on this box: one of three runs of the same binary diverged at turn
+8 of the agent session. A single gate failure needs a rerun; the kernel parity tests are the strict proof. Suspect:
+the adaptive expert swaps (`--adapt-swaps`, on by default) on the second card of the layer split.
 
 Measured and not kept (within ~5 %, and chunk size changes the text): `--prefill 4096/2048`,
 `STRATA_SPLIT_SMALL_OWN=2304/4608`, `--kv-resident 262144`.
@@ -69,16 +115,32 @@ split gains. Layer split stays.
 
 And structure: in layer split a turn's read is one chunk, so CUDA1 waits for CUDA0 (~4 s each, one after another).
 
+Decode (nsys with graph nodes, 32K context, 512-token answer; ~214 windows of ~46 ms; per card and window):
+dense quantized GEMVs (`native_mmvq_multi_kernel`) 3.1 / 4.2 ms, expert kernels 4.5 / 4.1 ms, hc read 2.6 / 2.5 ms,
+BF16 GEMVs 0.7 ms; the rest is the other card's turn (`wait_flag_ge_kernel`). Peak read bandwidth of a card: 589 GB/s
+(`__ldg` of 16 bytes). The dense GEMVs reach 450-560 GB/s for one column but 180-310 GB/s for four (`mmvq_bench`).
+
+**Timing tests and the CMP idle governor**: `cmp-idle-governor.service` forces P8 on an idle card and restores the
+load profile only after a few seconds of work, so short benches start at 645 MHz. `~/opt-avx1/perf.sh <cmd>` stops
+the governor and the CPU's C-states deeper than C1 for the test and always puts both back (idle cards run hot without
+the governor).
+
+**`pcie_frac` from the startup probe changes the text**: CUDA1's PCIe probe gave 6.0 GB/s in one run (pcie_frac 0.16)
+and 6.1 GB/s in others (0.17); the share of misses sent over PCIe moves experts between GPU and CPU, which round
+differently, and the text changed at turn 33 of 36. Gates now pass `--pcie-frac 0.17`, and the base and the new
+binary run back to back in one job.
+
 ## 5. Next steps (ranked)
 
 | # | step | type | exact? | gate |
 |---|---|---|---|---|
 | 1 | ~~Peer mode + QSA/GDN split~~ — measured, loses (section 3) | config | — | done |
-| 2 | Find what `wait_flag_ge_kernel` waits for in decode (CPU miss path vs card hand-off) | measure | — | nsys + pool timing |
+| 2 | ~~`wait_flag_ge_kernel` in decode~~ — `STRATA_VERIFY_PROFILE`: waitA 0.7 ms, waitCPU 0.1 ms per window; the CPU is not on the decode path. Decode is GPU work across many small kernels (expert kernels 31 %) | measure | — | done |
 | 3 | ~~AVX1 Q2_0 rows~~ — done (section 3); the activation quantizer is still scalar (small) | code | yes | done |
 | 4 | ~~Router lookahead AVX1~~ — done (section 3) | code | n/a | done |
 | 5 | `--pcie-frac`: "auto" parses as 0 (`atof`); dual `mkconfig.py` forces 0; `STRATA_PEER_HOT_AT=8700` is a 3090 value | config/code | — | agent session |
-| 6 | hc read BF16 GEMM, MMQ, prompt attention | code | needs a rounding-change OK | — |
+| 6 | ~~hc read~~ — `STRATA_HC_FP16=1` (section 3); MMQ (memory latency at 8 warps/SM, needs pipelining in ggml), prompt attention (300 ms per card) | code | MMQ/attn: yes | — |
+| 7 | Decode nondeterminism: repeat the agent session with `--adapt-swaps 0` | measure | — | 3 identical runs |
 
 Ideas taken from `Strata для AVX1 SM75 и IQ3_XXS.md`: peer prefill + QSA/GDN split A/B, the lookahead SIGILL path,
 `--pcie-frac` parsing, the Q2_0 kernel contract, the weak Q2 check in `native_expert_parity`. Its larger part (one
