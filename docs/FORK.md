@@ -43,16 +43,24 @@ xrip/llama.cpp-avx1-numa-sm75 was checked too: its SM75 MMQ tuning is for dense 
 codebook work is in files Strata does not use (Strata has its own decode kernels), and its AVX1 panel kernels are
 repack paths Strata does not call. Strata keeps the pinned llama.cpp (`3cf03257`).
 
-## A/B on the box (to do when it is free)
+## A/B on the box (2026-10-10)
 
-Build as `build-gcc14` (GCC 14, sm_75, `STRATA_ENABLE_CUDA=ON`) plus `-DSTRATA_ISA_FLOOR=avx`, in a separate folder.
-Base: the current `build/strata` (`avx1-sm75-opt`, `b44bb09`). Config: the gate config (`--adapt-swaps 0`,
-`--pcie-frac 0.17`), agentbench 34K -> 190K, fresh server for each arm, inside `perf.sh`.
+2x CMP 50HX + 2x Xeon E5-2670 v2, Flash-Next IQ3_XXS, `--layer-split auto`, the gate config (`--adapt-swaps 0`,
+`--pcie-frac 0.17`), agentbench 34K -> 190K (36 turns, +~4.4K tokens each), a fresh server per arm, inside `perf.sh`.
+Base: `build/strata` of `avx1-sm75-opt` (`b44bb09`). This branch built as `build-gcc14` plus `-DSTRATA_ISA_FLOOR=avx`.
 
-The text will not match the base word for word (upstream changed kernels the base had), so compare speed (time to
-first token, incremental read, decode) and check the answers by eye. Arms after the plain sync:
+| arm | median incremental read | decode, answers of 100+ tokens |
+|---|---:|---:|
+| base, two runs | 708.4 / 707.5 tok/s | ~60 tok/s |
+| this branch, two runs | 692.9 / 693.9 tok/s (-2 %) | ~69 tok/s (+15 %) |
+| this branch + `STRATA_BF16_TC=1` | 764.0 tok/s (+8 %) | ~72 tok/s (+19 %) |
+| this branch + `--pipeline-windows 2` | 691.0 tok/s (-2.5 %) | ~73 tok/s (+21 %) |
 
-- `STRATA_BF16_TC=1` (instead of the dropped `STRATA_HC_FP16`; other bits)
-- `--pipeline-windows` (layer split)
-- `STRATA_FS_SLOTS=<n>` (Foresight swap space: per-layer VRAM slots)
-- `STRATA_GDN_CHUNKED=2` (other bits)
+- Two runs of one build differ by under 1 %.
+- Decode only over the answers that ran to 100+ tokens (3-4 early turns per arm, 34K-48K): most answers in this
+  session stop after 15-40 tokens, so a median over all turns measures answer length more than speed.
+- The text differs from the base on every turn (other kernels); the answers were read and are on topic.
+- Not tried: `STRATA_GDN_CHUNKED=2` (slower on cards under 128 SMs in upstream's own measurements) and
+  `STRATA_FS_SLOTS` (lost on every box upstream measured; the decode cache here hits ~97-99 %).
+
+Chosen: `STRATA_BF16_TC=1`, set by the config's `"env"` (`~/strata-sync/strata-iq3_xxs.json` on the box).
